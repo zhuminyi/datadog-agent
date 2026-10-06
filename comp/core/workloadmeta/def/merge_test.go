@@ -237,3 +237,17 @@ func TestContainerImageMetadataMergeSBOM(t *testing.T) {
 	// src mutation does not affect the original entity (shallow-copy safety).
 	assert.Equal(t, trivySBOM, src.SBOM, "src SBOM must not be modified by merge")
 }
+
+func TestContainerMergeGPUDeviceIDsAcrossVendors(t *testing.T) {
+	id := EntityID{Kind: KindContainer, ID: "mixed-gpu-container"}
+	for _, amdFirst := range []bool{true, false} {
+		amd := &Container{EntityID: id, GPUDeviceIDs: []string{"amd-00c0ffee00c0ffee"}}
+		nvidia := &Container{EntityID: id, GPUDeviceIDs: []string{"GPU-physical", "MIG-instance"}}
+		dst, src := amd, nvidia
+		if !amdFirst {
+			dst, src = nvidia, amd
+		}
+		require.NoError(t, dst.Merge(src))
+		assert.ElementsMatch(t, []string{"amd-00c0ffee00c0ffee", "GPU-physical", "MIG-instance"}, dst.GPUDeviceIDs)
+	}
+}

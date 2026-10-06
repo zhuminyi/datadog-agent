@@ -4,6 +4,7 @@ load("//bazel/rules/go:dd_agent_go_test.bzl", "dd_agent_go_test")
 go_library(
     name = "amdgpu",
     srcs = [
+        "allocations.go",
         "amdgpu.go",
         "stub.go",
     ],
@@ -78,7 +79,11 @@ go_library(
 
 dd_agent_go_test(
     name = "amdgpu_test",
-    srcs = ["amdgpu_test.go"],
+    srcs = [
+        "allocations_test.go",
+        "amdgpu_test.go",
+    ],
+    data = glob(["testdata/dra/*"]),
     embed = [":amdgpu"],
     deps = select({
         "@rules_go//go/platform:android": [

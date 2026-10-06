@@ -630,6 +630,32 @@ func TestMatchByGPUDeviceIDs(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, filteredDevices, 0)
 	})
+
+	t.Run("MixedVendorIDsKeepNvidiaCUDAOrder", func(t *testing.T) {
+		filteredDevices, err := matchByGPUDeviceIDs([]string{
+			"amd-00c0ffee00c0ffee", testutil.GPUUUIDs[2], "amd-pci-0000:83:00.0", testutil.GPUUUIDs[0],
+		}, devices)
+		require.NoError(t, err)
+		assert.Equal(t, []ddnvml.Device{devices[2], devices[0]}, filteredDevices)
+	})
+
+	t.Run("AMDOnlyDoesNotReportNvidiaMappingFailure", func(t *testing.T) {
+		filteredDevices, err := matchByGPUDeviceIDs([]string{"amd-00c0ffee00c0ffee"}, devices)
+		require.NoError(t, err)
+		assert.Empty(t, filteredDevices)
+	})
+
+	for _, sentinel := range []string{"all", "none", "void"} {
+		t.Run("MixedVendorSentinel_"+sentinel, func(t *testing.T) {
+			filteredDevices, err := matchByGPUDeviceIDs([]string{"amd-00c0ffee00c0ffee", sentinel}, devices)
+			require.NoError(t, err)
+			if sentinel == "all" {
+				assert.Equal(t, devices, filteredDevices)
+			} else {
+				assert.Empty(t, filteredDevices)
+			}
+		})
+	}
 }
 
 func TestMatchContainerDevicesWithGPUDeviceIDs(t *testing.T) {
@@ -778,6 +804,37 @@ func TestMatchContainerDevicesWithGPUDeviceIDs(t *testing.T) {
 		require.Error(t, err)
 		require.Len(t, filteredDevices, 1)
 		assert.Equal(t, devices[0], filteredDevices[0])
+	})
+
+	t.Run("AMDMappingDoesNotMaskPartialNvidiaDRAResolution", func(t *testing.T) {
+		container := &workloadmeta.Container{
+			EntityID:     workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: "mixed-partial"},
+			Runtime:      workloadmeta.ContainerRuntimeContainerd,
+			GPUDeviceIDs: []string{"amd-00c0ffee00c0ffee", testutil.GPUUUIDs[0]},
+			ResolvedAllocatedResources: []workloadmeta.ContainerAllocatedResource{
+				{Name: string(gpuutil.GpuNvidiaDRA), ID: "gpu-0"},
+				{Name: string(gpuutil.GpuNvidiaDRA), ID: "gpu-1"},
+			},
+		}
+		filteredDevices, err := MatchContainerDevices(container, devices)
+		require.Error(t, err)
+		assert.Equal(t, []ddnvml.Device{devices[0]}, filteredDevices)
+		assert.ErrorContains(t, err, "1 of 2 devices")
+	})
+
+	t.Run("AMDOnlyMappingDoesNotSuppressNvidiaLegacyAndDRAResolution", func(t *testing.T) {
+		container := &workloadmeta.Container{
+			EntityID:     workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: "amd-and-unmapped-nvidia"},
+			Runtime:      workloadmeta.ContainerRuntimeContainerd,
+			GPUDeviceIDs: []string{"amd-00c0ffee00c0ffee"},
+			ResolvedAllocatedResources: []workloadmeta.ContainerAllocatedResource{
+				{Name: string(gpuutil.GpuNvidiaGeneric), ID: testutil.GPUUUIDs[2]},
+				{Name: string(gpuutil.GpuNvidiaDRA), ID: "gpu-1"},
+			},
+		}
+		filteredDevices, err := MatchContainerDevices(container, devices)
+		require.NoError(t, err)
+		assert.Equal(t, []ddnvml.Device{devices[1], devices[2]}, filteredDevices)
 	})
 }
 

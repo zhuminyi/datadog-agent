@@ -504,48 +504,30 @@ func pcieBandwidth(gtPerSecond, width amdgpu.Reading) amdgpu.Reading {
 	return amdgpu.Reading{Value: bps, Valid: true}
 }
 
-// gpuToContainers returns the containers that Kubernetes allocated AMD GPUs
-// to, keyed by AMD device UUID.
-// The allocations come from the kubelet PodResources API, whose device IDs for
-// AMD resources are resolved with amdgpu.MatchDevicePluginID. Several containers
-// can share a physical GPU when each is allocated one of its partitions.
+// gpuToContainers consumes physical AMD UUIDs published by workloadmeta.
+// Several containers can share a physical GPU through separate partitions.
+// Allocation resolution belongs to the collector; metric exclusions stay here.
 func (c *Check) gpuToContainers() map[string][]*workloadmeta.Container {
-	if len(c.devices) == 0 {
-		return nil
-	}
 	gpuToContainers := make(map[string][]*workloadmeta.Container)
-
-	for _, container := range c.wmeta.ListContainersWithFilter(hasAMDGPUResource) {
-		if containers.IsDatadogAgentContainer(c.wmeta, container) {
+	for _, container := range c.wmeta.ListContainers() {
+		if len(container.GPUDeviceIDs) == 0 || containers.IsDatadogAgentContainer(c.wmeta, container) {
 			continue
 		}
-		matched := make(map[string]struct{})
-		for _, resource := range container.ResolvedAllocatedResources {
-			if !strings.HasPrefix(resource.Name, amdgpu.ResourcePrefix) {
+		matched := make(map[string]struct{}, len(container.GPUDeviceIDs))
+		for _, deviceID := range container.GPUDeviceIDs {
+			if !gpuutil.IsAMDGPUDeviceID(deviceID) || c.isDeviceExcluded(deviceID) {
 				continue
 			}
-			dev := amdgpu.MatchDevicePluginID(c.sysRoot, c.devices, resource.ID)
-			if dev == nil {
+			if _, duplicate := matched[deviceID]; duplicate {
+				continue
+			}
+			matched[deviceID] = struct{}{}
+			if _, present := c.deviceTags[deviceID]; !present {
 				c.telemetry.missingContainerGpuMapping.Inc(container.Name)
 				continue
 			}
-			if _, dup := matched[dev.UUID]; dup {
-				continue // two partitions of the same GPU
-			}
-			matched[dev.UUID] = struct{}{}
-			gpuToContainers[dev.UUID] = append(gpuToContainers[dev.UUID], container)
+			gpuToContainers[deviceID] = append(gpuToContainers[deviceID], container)
 		}
 	}
 	return gpuToContainers
-}
-
-// hasAMDGPUResource reports whether Kubernetes allocated an AMD device plugin
-// resource to the container.
-func hasAMDGPUResource(container *workloadmeta.Container) bool {
-	for _, resource := range container.ResolvedAllocatedResources {
-		if strings.HasPrefix(resource.Name, amdgpu.ResourcePrefix) {
-			return true
-		}
-	}
-	return false
 }

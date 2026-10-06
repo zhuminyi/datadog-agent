@@ -37,7 +37,7 @@ const (
 
 // HasGPUs returns true if the container has GPUs assigned to it.
 func HasGPUs(container *workloadmeta.Container) bool {
-	// ECS: Check GPUDeviceIDs (populated by Docker collector for ECS only)
+	// Node-local GPU collectors and the ECS Docker collector publish assigned IDs.
 	if len(container.GPUDeviceIDs) > 0 {
 		return true
 	}
@@ -170,8 +170,17 @@ func matchDockerDevices(container *workloadmeta.Container, devices []ddnvml.Devi
 // The order of devices is preserved from the input gpuDeviceIDs, as this matches
 // the order CUDA will use when selecting devices.
 func matchByGPUDeviceIDs(gpuDeviceIDs []string, devices []ddnvml.Device) ([]ddnvml.Device, error) {
-	if len(gpuDeviceIDs) == 1 {
-		switch gpuDeviceIDs[0] {
+	var onlyID string
+	count := 0
+	for _, id := range gpuDeviceIDs {
+		if gpuutil.IsAMDGPUDeviceID(id) {
+			continue
+		}
+		onlyID = id
+		count++
+	}
+	if count == 1 {
+		switch onlyID {
 		case "all":
 			return devices, nil
 		case "none", "void":
@@ -183,6 +192,9 @@ func matchByGPUDeviceIDs(gpuDeviceIDs []string, devices []ddnvml.Device) ([]ddnv
 	var multiErr error
 
 	for _, id := range gpuDeviceIDs {
+		if gpuutil.IsAMDGPUDeviceID(id) {
+			continue // AMD ownership is consumed by the AMD check, not NVML
+		}
 		// ECS provides GPU UUIDs in format "GPU-xxxx-xxxx-xxxx-xxxx"
 		matchingDevice, err := findDeviceByUUID(devices, id)
 		if err != nil {
@@ -205,7 +217,12 @@ func matchKubernetesDevices(container *workloadmeta.Container, devices []ddnvml.
 	// that on a MIG-partitioned node, so take the mapping first. It is a
 	// union rather than a short-circuit: a container can hold both DRA and
 	// device-plugin resources, and only the DRA ones appear in the mapping.
-	mapped := len(container.GPUDeviceIDs)
+	mapped := 0
+	for _, id := range container.GPUDeviceIDs {
+		if !gpuutil.IsAMDGPUDeviceID(id) {
+			mapped++
+		}
+	}
 	if mapped > 0 {
 		matched, err := matchByGPUDeviceIDs(container.GPUDeviceIDs, devices)
 		multiErr = errors.Join(multiErr, err)

@@ -22,6 +22,22 @@ The full list is in the documentation for the `Source` type.
 Multiple sources may generate events about the same entity.
 When this occurs, information from those sources is merged into one entity.
 
+### GPU allocations
+
+`Container.GPUDeviceIDs` exposes node-local GPU allocation identities. NVIDIA
+collectors publish physical and MIG UUIDs under `SourceNVML`; the AMD collector
+publishes physical `amd-...` UUIDs under `SourceAMDGPU` for both device-plugin
+and DRA allocations. Vendor contributions are merged without replacing each
+other. Each collector's next set replaces its own contribution, and an unset
+removes only that source.
+
+AMD resolves current claim-specific CDI entries against discovered hardware on
+each pull. A verified subset may be published alongside a collector error;
+missing or contradictory ownership is retracted rather than retained. The AMD
+check consumes these IDs and applies its metric exclusions, without resolving
+raw allocations itself. Containerized Agents need read-only host CDI files at
+`/host/var/run/cdi` for DRA resolution.
+
 ## Store
 
 The _Store_ is the central component of the package, storing the set of entities.

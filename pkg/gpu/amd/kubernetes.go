@@ -22,6 +22,9 @@ import (
 // "mixed" resource naming strategy.
 const ResourcePrefix = "amd.com/"
 
+// DRADriver is the AMD GPU Dynamic Resource Allocation driver name.
+const DRADriver = "gpu.amd.com"
+
 // xcpDeviceRegex matches the device plugin ID of a compute partition, which is
 // the name of its platform device (/sys/devices/platform/amdgpu_xcp_<N>).
 var xcpDeviceRegex = regexp.MustCompile(`^amdgpu_xcp_[0-9]+$`)

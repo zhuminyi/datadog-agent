@@ -13,3 +13,7 @@ features:
     Enable it with ``gpu.amd.enabled: true`` alongside ``gpu.enabled: true``.
     AMD GPUs are collected by a separate ``amd_gpu`` check, and hosts with AMD
     GPUs get the ``gpu_host:true`` host tag only when AMD collection is enabled.
+  - |
+    AMD device-plugin and ``gpu.amd.com`` DRA allocations are exposed through
+    workloadmeta, enabling device metric tags for idle Pods. DRA requires
+    host ``/var/run/cdi`` mounted read-only at ``/host/var/run/cdi``.

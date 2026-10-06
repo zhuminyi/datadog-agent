@@ -41,10 +41,12 @@ type collector struct {
 	catalog                            workloadmeta.AgentType
 	store                              workloadmeta.Component
 	sysRoot                            string
+	cdiSpecDirs                        []string
 	enabled                            bool
 	integrateWithWorkloadmetaProcesses bool
 	seenUUIDs                          map[string]struct{}
-	seenPIDsToGPUs                     map[int][]string // PID -> GPU UUIDs
+	seenPIDsToGPUs                     map[int][]string    // PID -> GPU UUIDs
+	seenContainerIDs                   map[string]struct{} // containers with this source's allocation contribution
 	// kfdDeniedLogLimit rate-limits the warning about an unreadable KFD
 	// topology: that condition does not change between pulls.
 	kfdDeniedLogLimit *log.Limit
@@ -57,8 +59,10 @@ func newCollector(cfg config.Component, sysRoot string) *collector {
 		id:                collectorID,
 		catalog:           workloadmeta.NodeAgent,
 		sysRoot:           sysRoot,
+		cdiSpecDirs:       amd.DefaultCDISpecDirs,
 		seenUUIDs:         make(map[string]struct{}),
 		seenPIDsToGPUs:    make(map[int][]string),
+		seenContainerIDs:  make(map[string]struct{}),
 		kfdDeniedLogLimit: log.NewLogLimit(1, kfdDeniedLogInterval),
 	}
 	if cfg != nil {
@@ -89,9 +93,9 @@ func (c *collector) Start(_ context.Context, store workloadmeta.Component) error
 	return nil
 }
 
-// Pull discovers the AMD GPUs and the processes using them, and reconciles the
-// store with the result. Partial results are published without retracting
-// unobserved entities; the store handles error logging and pull telemetry.
+// Pull discovers AMD GPUs, processes and container allocations and reconciles
+// the store. Partial topology preserves unobserved GPUs/processes; allocations
+// retain only currently verified ownership. The store handles errors/telemetry.
 func (c *collector) Pull(_ context.Context) error {
 	devices, discoveryErr := amd.Discover(c.sysRoot)
 	if msg := amd.KFDAccessDeniedWarning(devices); msg != "" && c.kfdDeniedLogLimit.ShouldLog() {
@@ -146,8 +150,11 @@ func (c *collector) Pull(_ context.Context) error {
 		events = append(events, c.processEvents(pidToGPUs)...)
 	}
 
+	allocationEvents, allocationErr := c.containerEvents(devices)
+	events = append(events, allocationEvents...)
+
 	c.store.Notify(events)
-	return errors.Join(discoveryErr, usageErr)
+	return errors.Join(discoveryErr, usageErr, allocationErr)
 }
 
 // gpuEntity builds the workloadmeta entity of an AMD GPU. Fields without an

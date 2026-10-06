@@ -505,60 +505,29 @@ func TestAMDHungTelemetryReadDoesNotBlockCheck(t *testing.T) {
 	assert.Empty(t, check.pendingReads)
 }
 
-func TestAMDKubernetesAllocationsTagDeviceMetrics(t *testing.T) {
-	fs := amdgpu.NewFakeSysfs(t)
-	fs.AddCard("card0", fs.AddPCIDevice("0000:c1:00.0", "amdgpu", amdgpu.MI300XAttributes("00c0ffee00c0ffee")))
-	fs.AddCard("card1", fs.AddPCIDevice("0000:d1:00.0", "amdgpu", amdgpu.MI300XAttributes("")))
-	// 0000:d1:00.0 is split in two compute partitions (render nodes 129 and 130).
-	fs.AddKFDNode(1, 4101, 0, 0xc100, 90402)
-	fs.AddKFDNode(2, 4102, 0, 0xd100, 90402)
-	fs.SetKFDRenderMinor(2, 129)
-	fs.AddKFDNode(3, 4103, 0, 0xd101, 90402)
-	fs.SetKFDRenderMinor(3, 130)
-	fs.AddPartitionRenderNode("amdgpu_xcp_1", 129)
-	fs.AddPartitionRenderNode("amdgpu_xcp_2", 130)
-
+func TestAMDPublishedUUIDsTagSharedDeviceMetrics(t *testing.T) {
+	fs := amdAllocationHost(t)
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	check, mockSender := setupAMDCheckWithTagger(t, fakeTagger, fs.Root, nil, map[int]string{})
-	wmetaMock, ok := check.wmeta.(workloadmetamock.Mock)
-	require.True(t, ok)
+	check, snd := setupAMDCheckWithTagger(t, fakeTagger, fs.Root, nil, map[int]string{})
+	wmeta := check.wmeta.(workloadmetamock.Mock)
 
-	addPod := func(containerID string, resources ...workloadmeta.ContainerAllocatedResource) {
-		wmetaMock.Set(&workloadmeta.Container{
-			EntityID:                   workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: containerID},
-			EntityMeta:                 workloadmeta.EntityMeta{Name: containerID},
-			ResolvedAllocatedResources: resources,
+	for id, ids := range map[string][]string{
+		"whole": {amdAllocationFirstUUID},
+		"part1": {testAMDUUID, testAMDUUID},
+		"part2": {testAMDUUID},
+	} {
+		wmeta.Set(&workloadmeta.Container{
+			EntityID:   workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: id},
+			EntityMeta: workloadmeta.EntityMeta{Name: id},
 		})
-		fakeTagger.SetTags(taggertypes.NewEntityID(taggertypes.ContainerID, containerID), "fake", []string{"container_id:" + containerID}, nil, nil, nil)
+		publishAMDAllocation(wmeta, id, ids)
+		fakeTagger.SetTags(taggertypes.NewEntityID(taggertypes.ContainerID, id), "fake", []string{"container_id:" + id}, nil, nil, nil)
 	}
-	// Whole GPU with the default "single" resource naming strategy.
-	addPod("whole", workloadmeta.ContainerAllocatedResource{Name: "amd.com/gpu", ID: "0000:c1:00.0"})
-	// One partition each, with the "mixed" strategy resource name.
-	addPod("part1", workloadmeta.ContainerAllocatedResource{Name: "amd.com/cpx_nps4", ID: "amdgpu_xcp_1"})
-	addPod("part2", workloadmeta.ContainerAllocatedResource{Name: "amd.com/cpx_nps4", ID: "amdgpu_xcp_2"})
-	// NVIDIA and unknown AMD allocations are not attributed to AMD GPUs.
-	addPod("nvidia", workloadmeta.ContainerAllocatedResource{Name: "nvidia.com/gpu", ID: "GPU-00000000-1234-1234-1234-123456789012"})
-	addPod("stale", workloadmeta.ContainerAllocatedResource{Name: "amd.com/gpu", ID: "0000:e1:00.0"})
-
 	require.NoError(t, check.Run())
-
-	containersByUUID := map[string][]string{}
-	for _, call := range emittedGauges(mockSender)["gpu.gr_engine_active"] {
-		var uuid string
-		var ctrs []string
-		for _, tag := range call.Arguments.Get(3).([]string) {
-			if v, ok := strings.CutPrefix(tag, "gpu_uuid:"); ok {
-				uuid = v
-			}
-			if v, ok := strings.CutPrefix(tag, "container_id:"); ok {
-				ctrs = append(ctrs, v)
-			}
-		}
-		containersByUUID[uuid] = ctrs
-	}
-	require.Len(t, containersByUUID, 2)
-	assert.ElementsMatch(t, []string{"whole"}, containersByUUID[testAMDUUID])
-	assert.ElementsMatch(t, []string{"part1", "part2"}, containersByUUID["amd-0000-d1-00-0"])
+	assertAMDIdleAllocationTags(t, snd, map[string][]string{
+		amdAllocationFirstUUID: {"container_id:whole"},
+		testAMDUUID:            {"container_id:part1", "container_id:part2"},
+	})
 }
 
 func TestAMDCheckDisabledByConfig(t *testing.T) {
@@ -573,4 +542,246 @@ func TestAMDCheckDisabledByConfig(t *testing.T) {
 			require.Error(t, check.Configure(mocksender.CreateDefaultDemultiplexer(t), integration.FakeConfigHash, []byte{}, []byte{}, "test", "provider"))
 		})
 	}
+}
+
+const amdAllocationFirstUUID = "amd-0000-82-00-0"
+
+// Allocation tests publish the collector's output, not a simulated resolver.
+func publishAMDAllocation(wmeta workloadmetamock.Mock, containerID string, ids []string) {
+	wmeta.Notify([]workloadmeta.CollectorEvent{{
+		Type:   workloadmeta.EventTypeSet,
+		Source: workloadmeta.SourceAMDGPU,
+		Entity: &workloadmeta.Container{
+			EntityID:     workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: containerID},
+			GPUDeviceIDs: ids,
+		},
+	}})
+}
+
+// Both GPUs are idle; separate KFD partitions still belong to one physical GPU.
+func amdAllocationHost(t *testing.T) *amdgpu.FakeSysfs {
+	t.Helper()
+	fs := amdgpu.NewFakeSysfs(t)
+	for i, pci := range []string{"0000:82:00.0", "0000:83:00.0"} {
+		serial := ""
+		if i == 1 {
+			serial = "00c0ffee00c0ffee"
+		}
+		attrs := amdgpu.MI300XAttributes(serial)
+		attrs["gpu_busy_percent"] = "0\n"
+		fs.AddCard("card"+strconv.Itoa(i), fs.AddPCIDevice(pci, "amdgpu", attrs))
+	}
+	fs.AddKFDNode(1, 4101, 0, 0x8200, 90402)
+	fs.SetKFDRenderMinor(1, 128)
+	fs.AddKFDNode(2, 4102, 0, 0x8300, 90402)
+	fs.SetKFDRenderMinor(2, 129)
+	fs.AddKFDNode(3, 4103, 0, 0x8301, 90402)
+	fs.SetKFDRenderMinor(3, 130)
+	fs.AddPartitionRenderNode("amdgpu_xcp_1", 129)
+	fs.AddPartitionRenderNode("amdgpu_xcp_2", 130)
+	return fs
+}
+
+func assertAMDIdleAllocationTags(t *testing.T, snd *mocksender.MockSender, expected map[string][]string) {
+	t.Helper()
+	gauges := emittedGauges(snd)
+	for metric, value := range map[string]float64{
+		"gpu.gr_engine_active": 0,
+		"gpu.device.total":     1,
+		"gpu.memory.limit":     206141652992,
+		"gpu.memory.free":      206141652992 - 294965248,
+	} {
+		actual := make(map[string][]string)
+		for _, call := range gauges[metric] {
+			assert.Equal(t, value, call.Arguments.Get(1), metric)
+			var uuid string
+			var workloadTags []string
+			for _, tag := range call.Arguments.Get(3).([]string) {
+				if v, ok := strings.CutPrefix(tag, "gpu_uuid:"); ok {
+					uuid = v
+				}
+				if strings.HasPrefix(tag, "container_id:") || strings.HasPrefix(tag, "pod_name:") {
+					workloadTags = append(workloadTags, tag)
+				}
+			}
+			require.NotEmpty(t, uuid, metric)
+			_, duplicate := actual[uuid]
+			require.False(t, duplicate, "duplicate %s metric for %s", metric, uuid)
+			actual[uuid] = workloadTags
+		}
+		require.Len(t, actual, len(expected), metric)
+		for uuid, tags := range expected {
+			require.Contains(t, actual, uuid, metric)
+			assert.ElementsMatch(t, tags, actual[uuid], "%s %s", metric, uuid)
+		}
+	}
+	assert.Empty(t, gauges["gpu.process.memory.usage"], "idle allocations must not invent process usage")
+}
+
+func TestAMDPublishedIdleDeviceMetricTags(t *testing.T) {
+	const nvidiaUUID = "GPU-00000000-1234-1234-1234-123456789012"
+	rawResources := []workloadmeta.ContainerAllocatedResource{
+		{Name: "amd.com/gpu", ID: "0000:82:00.0"},
+		{Name: "gpu.amd.com", ID: "gpu-1-129", CdiDevices: []string{"k8s.gpu.amd.com/gpu=common", "k8s.gpu.amd.com/gpu=11111111-1111-4111-8111-111111111111-gpu-1-129"}},
+	}
+	for _, tc := range []struct {
+		name      string
+		ids       []string
+		nvidiaIDs []string
+		resources []workloadmeta.ContainerAllocatedResource
+		first     bool
+		second    bool
+		missing   float64
+		excluded  bool
+		agent     bool
+	}{
+		{name: "idle allocation without raw resources", ids: []string{testAMDUUID}, second: true},
+		{name: "published UUID wins over raw resource identity", ids: []string{testAMDUUID}, resources: rawResources[:1], second: true},
+		{name: "physical union and duplicate IDs", ids: []string{amdAllocationFirstUUID, testAMDUUID, testAMDUUID}, first: true, second: true},
+		{name: "mixed AMD NVIDIA identities", ids: []string{testAMDUUID}, nvidiaIDs: []string{nvidiaUUID}, second: true},
+		{name: "NVIDIA identity ignored", nvidiaIDs: []string{nvidiaUUID}},
+		{name: "unresolved raw allocations do not guess tags", resources: rawResources},
+		{name: "absent allocation"},
+		{name: "missing published physical identity", ids: []string{"amd-0000-99-00-0"}, missing: 1},
+		{name: "successful published subset", ids: []string{testAMDUUID, "amd-0000-99-00-0", "amd-0000-99-00-0"}, second: true, missing: 1},
+		{name: "excluded allocation is not unresolved", ids: []string{testAMDUUID}, excluded: true},
+		{name: "Agent pod excluded", ids: []string{testAMDUUID}, agent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := amdAllocationHost(t)
+			fakeTagger := taggerfxmock.SetupFakeTagger(t)
+			var settings map[string]any
+			if tc.excluded {
+				settings = map[string]any{"gpu.excluded_devices": []string{testAMDUUID}}
+			}
+			check, snd := setupAMDCheckWithTagger(t, fakeTagger, fs.Root, settings, map[int]string{})
+			wmeta := check.wmeta.(workloadmetamock.Mock)
+			owner := &workloadmeta.EntityID{Kind: workloadmeta.KindKubernetesPod, ID: "pod-workload"}
+			wmeta.Set(&workloadmeta.Container{
+				EntityID:                   workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: "workload"},
+				EntityMeta:                 workloadmeta.EntityMeta{Name: "workload"},
+				Owner:                      owner,
+				ResolvedAllocatedResources: tc.resources,
+			})
+			if tc.ids != nil {
+				publishAMDAllocation(wmeta, "workload", tc.ids)
+			}
+			if tc.nvidiaIDs != nil {
+				wmeta.Notify([]workloadmeta.CollectorEvent{{
+					Type:   workloadmeta.EventTypeSet,
+					Source: workloadmeta.SourceNVML,
+					Entity: &workloadmeta.Container{
+						EntityID:     workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: "workload"},
+						GPUDeviceIDs: tc.nvidiaIDs,
+					},
+				}})
+			}
+			fakeTagger.SetTags(taggertypes.NewEntityID(taggertypes.ContainerID, "workload"), "fake", []string{"container_id:workload", "pod_name:allocated-pod"}, nil, nil, nil)
+			if tc.agent {
+				wmeta.Set(&workloadmeta.Container{
+					EntityID: workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: "agent"},
+					Owner:    owner,
+				})
+				publishAMDAllocation(wmeta, "agent", tc.ids)
+				wmeta.Set(&workloadmeta.Process{
+					EntityID: workloadmeta.EntityID{Kind: workloadmeta.KindProcess, ID: strconv.Itoa(os.Getpid())},
+					Pid:      int32(os.Getpid()),
+					Owner:    &workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: "agent"},
+				})
+				fakeTagger.SetTags(taggertypes.NewEntityID(taggertypes.ContainerID, "agent"), "fake", []string{"container_id:agent"}, nil, nil, nil)
+			}
+			require.NoError(t, check.Run())
+			expected := map[string][]string{amdAllocationFirstUUID: nil}
+			if !tc.excluded {
+				expected[testAMDUUID] = nil
+			}
+			tags := []string{"container_id:workload", "pod_name:allocated-pod"}
+			if tc.first {
+				expected[amdAllocationFirstUUID] = tags
+			}
+			if tc.second {
+				expected[testAMDUUID] = tags
+			}
+			assertAMDIdleAllocationTags(t, snd, expected)
+			assert.Equal(t, tc.missing, check.telemetry.missingContainerGpuMapping.WithValues("workload").Get())
+		})
+	}
+}
+
+func TestAMDPublishedAllocationFreshness(t *testing.T) {
+	fs := amdAllocationHost(t)
+	fakeTagger := taggerfxmock.SetupFakeTagger(t)
+	check, snd := setupAMDCheckWithTagger(t, fakeTagger, fs.Root, map[string]any{"gpu.static_metrics_reporting_interval": 0}, map[int]string{})
+	wmeta := check.wmeta.(workloadmetamock.Mock)
+	container := &workloadmeta.Container{
+		EntityID:                   workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: "old"},
+		EntityMeta:                 workloadmeta.EntityMeta{Name: "old"},
+		ResolvedAllocatedResources: []workloadmeta.ContainerAllocatedResource{{Name: "amd.com/gpu", ID: "0000:82:00.0"}},
+	}
+	wmeta.Set(container)
+	fakeTagger.SetTags(taggertypes.NewEntityID(taggertypes.ContainerID, "old"), "fake", []string{"container_id:old", "pod_name:old-pod"}, nil, nil, nil)
+	fakeTagger.SetTags(taggertypes.NewEntityID(taggertypes.ContainerID, "new"), "fake", []string{"container_id:new", "pod_name:new-pod"}, nil, nil, nil)
+	run := func(first, second string) {
+		t.Helper()
+		snd.Mock.Calls = nil
+		require.NoError(t, check.Run())
+		expected := map[string][]string{amdAllocationFirstUUID: nil, testAMDUUID: nil}
+		for uuid, id := range map[string]string{amdAllocationFirstUUID: first, testAMDUUID: second} {
+			if id != "" {
+				expected[uuid] = []string{"container_id:" + id, "pod_name:" + id + "-pod"}
+			}
+		}
+		assertAMDIdleAllocationTags(t, snd, expected)
+	}
+	retract := func(id string) {
+		wmeta.Notify([]workloadmeta.CollectorEvent{{
+			Type:   workloadmeta.EventTypeUnset,
+			Source: workloadmeta.SourceAMDGPU,
+			Entity: &workloadmeta.Container{EntityID: workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: id}},
+		}})
+	}
+	run("", "")
+	publishAMDAllocation(wmeta, "old", []string{testAMDUUID})
+	run("", "old")
+	// Replacement drops the old physical UUID even though workload tags are cached.
+	publishAMDAllocation(wmeta, "old", []string{amdAllocationFirstUUID})
+	run("old", "")
+	retract("old")
+	run("", "")
+	publishAMDAllocation(wmeta, "old", []string{testAMDUUID})
+	run("", "old")
+	// Raw resource removal does not override the collector's published identity.
+	wmeta.Unset(container)
+	cleared := *container
+	cleared.ResolvedAllocatedResources = nil
+	wmeta.Set(&cleared)
+	run("", "old")
+	// Only NVIDIA's contribution remains after AMD retracts.
+	wmeta.Notify([]workloadmeta.CollectorEvent{{
+		Type:   workloadmeta.EventTypeSet,
+		Source: workloadmeta.SourceNVML,
+		Entity: &workloadmeta.Container{
+			EntityID:     container.EntityID,
+			GPUDeviceIDs: []string{"GPU-00000000-1234-1234-1234-123456789012"},
+		},
+	}})
+	retract("old")
+	run("", "")
+	publishAMDAllocation(wmeta, "old", []string{amdAllocationFirstUUID})
+	run("old", "")
+	// Container deletion includes the collectors' source retractions.
+	wmeta.Unset(&cleared)
+	retract("old")
+	wmeta.Notify([]workloadmeta.CollectorEvent{{
+		Type:   workloadmeta.EventTypeUnset,
+		Source: workloadmeta.SourceNVML,
+		Entity: &workloadmeta.Container{EntityID: container.EntityID},
+	}})
+	run("", "")
+	replacement := *container
+	replacement.EntityID.ID = "new"
+	replacement.EntityMeta.Name = "new"
+	wmeta.Set(&replacement)
+	publishAMDAllocation(wmeta, "new", []string{testAMDUUID})
+	run("", "new")
 }

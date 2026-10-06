@@ -83,6 +83,12 @@ func IsNvidiaKubernetesResource(resourceName string) bool {
 		resourceName == string(GpuNvidiaDRA)
 }
 
+// IsAMDGPUDeviceID reports whether a workloadmeta GPU identity belongs to AMD.
+// Both serial-based and PCI-based physical AMD UUIDs use the "amd-" namespace.
+func IsAMDGPUDeviceID(id string) bool {
+	return strings.HasPrefix(id, "amd-")
+}
+
 // ExtractGPUType returns the normalized GPU model type from a device name.
 func ExtractGPUType(deviceName string) string {
 	if deviceName == "" {

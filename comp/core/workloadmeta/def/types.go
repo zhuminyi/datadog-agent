@@ -673,12 +673,12 @@ type Container struct {
 	// ResolvedAllocatedResources is the list of resources allocated to this pod. Requires the
 	// PodResources API to query that data.
 	ResolvedAllocatedResources []ContainerAllocatedResource
-	// GPUDeviceIDs contains the GPU device UUIDs assigned to this container.
-	// Format: ["GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", "MIG-xxxxxxxx-..."]
-	// On ECS it is extracted from the NVIDIA_VISIBLE_DEVICES environment
-	// variable. On Kubernetes with DRA (Dynamic Resource Allocation), it is
-	// populated node-locally by resolving the container's CDI device
-	// allocations to NVML UUIDs (physical GPUs and MIG instances).
+	// GPUDeviceIDs contains node-local GPU identities assigned to this container:
+	// NVIDIA physical/MIG UUIDs ("GPU-...", "MIG-...") and AMD physical UUIDs ("amd-...").
+	// GPU collectors publish their own contributions, merged across sources.
+	// NVIDIA resolves DRA allocations; AMD resolves device-plugin and DRA allocations.
+	// A published set may be partial when some allocated resources cannot be resolved.
+	// On ECS the Docker collector also preserves NVIDIA_VISIBLE_DEVICES sentinels.
 	GPUDeviceIDs []string `proto:"ignore"`
 	// CgroupPath is a path to the cgroup of the container.
 	// It can be relative to the cgroup parent.
